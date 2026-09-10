@@ -15,6 +15,8 @@
       .venv-pyannote  the default speaker-splitting engine (pyannote)
       .venv-nemo      optional alternative engine (-WithNemo; large download)
       web/dist        the built dashboard interface
+      discord-receiver/node_modules
+                      the Discord bot's packages, needed to record Discord calls
 
     After it finishes you still need, depending on what you use:
       - a Hugging Face token for speaker splitting (free; the dashboard's
@@ -40,7 +42,7 @@ $py = Get-Command py -ErrorAction SilentlyContinue
 if (-not $py) { throw "Python launcher 'py' not found. Install Python 3.11 from python.org (tick 'py launcher')." }
 try { py -3.11 -c "pass" } catch { throw "Python 3.11 not installed. Install it from python.org; other versions are untested." }
 $node = Get-Command npm -ErrorAction SilentlyContinue
-if (-not $node) { Write-Warning "npm not found: the web dashboard cannot be built. Install Node.js 22+ and re-run, or use the CLI only." }
+if (-not $node) { Write-Warning "npm not found: the web dashboard cannot be built and Discord cannot be recorded. Install Node.js 22+ and re-run." }
 
 # ---- main environment ------------------------------------------------------
 Step "Main environment (.venv): transcription, dashboard, CLI"
@@ -79,6 +81,14 @@ if ($node) {
     Push-Location web
     npm install --silent
     npm run build --silent
+    Pop-Location
+    Write-Host "    ok"
+
+    # The bot is a Node program the dashboard launches when Discord is ticked.
+    # Without its packages it exits at once and the channel is never joined.
+    Step "Discord receiver (discord-receiver): the bot that records each participant"
+    Push-Location discord-receiver
+    npm install --silent
     Pop-Location
     Write-Host "    ok"
 }
