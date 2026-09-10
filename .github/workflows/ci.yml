@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Windows, because that is where this runs: the install path here is the one
+  # setup.ps1 uses for the main environment.
+  python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -e ".[web,test]"
+      - name: Unit tests
+        run: python -m pytest -q
+
+  dashboard:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the dashboard
+        run: pip install -e ".[web,test]"
+      - name: Build the interface
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Install test dependencies
+        working-directory: e2e
+        run: npm ci
+      - name: Install the browser
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+      - name: End-to-end tests
+        working-directory: e2e
+        run: npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7
+
+  receiver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Portable JavaScript, so it does not need a Windows runner to prove it
+      # still parses and installs.
+      - name: Discord receiver installs
+        working-directory: discord-receiver
+        run: npm ci
+      - name: Discord receiver parses
+        working-directory: discord-receiver
+        run: node --check src/index.js

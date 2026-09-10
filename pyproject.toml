@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avilistener"
+version = "0.1.0"
+description = "Local Windows meeting recorder: captures system audio, microphone and Discord, then transcribes and splits it by speaker."
+requires-python = ">=3.10"
+dependencies = [
+  "faster-whisper",
+  "numpy",
+  "PyYAML",
+  "rich",
+  "soundcard",
+  "tzdata",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+web = ["fastapi", "uvicorn"]
+
+[project.scripts]
+avilistener = "avilistener.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["avilistener*"]

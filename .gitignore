@@ -1,0 +1,52 @@
+# Python
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+web/dist/
+e2e/test-results/
+e2e/playwright-report/
+npm-debug.log*
+
+# Local agent tooling, not product code
+.claude/
+.codex/
+.agents/
+skills-lock.json
+
+# Local config and secrets. Only config.example.yaml is tracked; anything else
+# holds real device names, channel IDs or tokens.
+.env
+.env.*
+config.yaml
+config.*.yaml
+!config.example.yaml
+
+# Recordings, transcripts and everything derived from them. The dashboard keeps
+# all of it under workspace/, including saved tokens; the rest are output
+# directories from earlier versions that may still exist locally.
+workspace/
+recordings/
+recordings-*/
+transcripts/
+transcripts-*/
+meeting-*/
+merged/
+merged-*/
+video-diarized/
+discord-user-audio/
+discord-user-audio-*/
+meet-user-audio/
+meet-user-audio-*/
+.meet-profile/
+*.rttm
+*.pcm
+*.wav
+
+# Logs
+*.log

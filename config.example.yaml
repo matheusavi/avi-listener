@@ -1,0 +1,31 @@
+# Settings for `avilistener levels`, the microphone check you run once before
+# the first recording. Copy this to config.yaml (setup.ps1 does it for you).
+#
+# Everything else - the model, the language, the devices, the word lists - is
+# per meeting and lives in the dashboard's Settings panel, not in this file.
+
+sample_rate: 16000
+
+# The speech gate adapts to each source's own noise floor by default, because
+# a quiet microphone and a speaker loopback can differ by more than 10x in
+# level and no single threshold suits both.
+recording:
+  silence_duration_ms: 1500
+  preroll_ms: 300
+  min_segment_ms: 700
+  # How far above the measured noise floor counts as speech.
+  noise_multiplier: 5.0
+  # The gate never drops below this, so hiss is not recorded as speech.
+  min_threshold: 0.0006
+
+sources:
+  system:
+    enabled: true
+    kind: loopback
+    device:
+  mic:
+    enabled: true
+    kind: microphone
+    device:
+    # Set a fixed gate for this source only if the adaptive one gets it wrong.
+    # silence_rms_threshold: 0.0012
