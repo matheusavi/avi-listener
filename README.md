@@ -1,5 +1,7 @@
 # AviListener
 
+[![CI](https://github.com/matheusavi/avi-listener/actions/workflows/ci.yml/badge.svg)](https://github.com/matheusavi/avi-listener/actions/workflows/ci.yml)
+
 Local app for Windows that records your meetings or RPG sessions, transcribes them using AI, and automatically labels who said what.
 
 ### **100% offline and private** - nothing is uploaded to the cloud
