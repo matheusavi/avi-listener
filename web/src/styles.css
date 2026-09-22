@@ -127,6 +127,26 @@ input, select {
   color: var(--muted); margin-top: 10px;
 }
 
+/* The live log is bounded so a long session never pushes the rest of the page
+   away; it scrolls inside, with a scrollbar that is visible on the dark theme
+   and a way back to the newest line after reading older ones. */
+.live-log-wrap { position: relative; }
+.live-log {
+  max-height: 40vh; min-height: 120px;
+  overflow-y: scroll; scrollbar-gutter: stable;
+  color-scheme: dark; scrollbar-color: #3a4150 #0b0d11;
+}
+.live-log::-webkit-scrollbar { width: 12px; }
+.live-log::-webkit-scrollbar-track { background: #0b0d11; border-radius: 8px; }
+.live-log::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 8px; border: 2px solid #0b0d11; }
+.live-log::-webkit-scrollbar-thumb:hover { background: #4b5468; }
+.live-jump {
+  position: absolute; right: 24px; bottom: 12px;
+  font-size: 12px; padding: 5px 10px; border-radius: 999px;
+  background: var(--panel-2); border-color: var(--accent); color: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
 .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
 .tab { padding: 6px 12px; font-size: 13px; }
 .tab.active { border-color: var(--accent); color: var(--accent); }

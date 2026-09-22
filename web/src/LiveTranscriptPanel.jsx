@@ -44,6 +44,9 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
   const after = useRef(0);
   const logRef = useRef(null);
   const followTail = useRef(true);
+  // Mirrors followTail for rendering: a ref does not re-render, and the
+  // "jump to latest" control has to appear the moment the reader scrolls up.
+  const [pinned, setPinned] = useState(true);
   const wasActive = useRef(false);
 
   const poll = useCallback(async () => {
@@ -104,6 +107,14 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
     const node = logRef.current;
     if (!node) return;
     followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+    setPinned(followTail.current);
+  };
+
+  const jumpToLatest = () => {
+    const node = logRef.current;
+    followTail.current = true;
+    setPinned(true);
+    if (node) node.scrollTop = node.scrollHeight;
   };
 
   const runAction = async (action) => {
@@ -124,6 +135,7 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
     after.current = 0;
     setLines([]);
     followTail.current = true;
+    setPinned(true);
     return runAction(() => api.liveStart(project, meeting, { model_size: model, mode }));
   };
 
@@ -186,12 +198,19 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
         </div>
       ) : null}
 
-      <div className="log" style={{ maxHeight: "40vh" }} ref={logRef} onScroll={onScroll}>
-        {lines.length
-          ? lines.map((line) => <div key={line.index}>{formatLiveLine(line)}</div>)
-          : active
-          ? "Listening for new clips…"
-          : "Nothing transcribed live yet."}
+      <div className="live-log-wrap">
+        <div className="log live-log" ref={logRef} onScroll={onScroll}>
+          {lines.length
+            ? lines.map((line) => <div key={line.index}>{formatLiveLine(line)}</div>)
+            : active
+            ? "Listening for new clips…"
+            : "Nothing transcribed live yet."}
+        </div>
+        {!pinned && lines.length ? (
+          <button type="button" className="live-jump" onClick={jumpToLatest}>
+            Jump to latest ({lines.length} lines)
+          </button>
+        ) : null}
       </div>
     </>
   );
