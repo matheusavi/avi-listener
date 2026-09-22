@@ -22,6 +22,8 @@ avilistener/            Python package
   speakers.py           per-speaker audio samples for identification
   cli.py                dashboard, list-devices, levels, live — nothing else
   server/               dashboard: workspace model, jobs, FastAPI
+  server/live.py        live sessions for the dashboard: clip discovery,
+                        watermark, one session at a time
 discord-receiver/       Node.js Discord bot, one WAV per participant
 web/                    React dashboard (Vite)
 e2e/                    Playwright tests driving the real dashboard
@@ -147,6 +149,73 @@ question.
 only, which is the point: a smaller model for live latency, the large one kept
 in `config.yaml` for the offline transcript. Clips land in
 `workspace/live/<timestamp>/` unless `--output` says otherwise.
+
+### Live in the dashboard
+
+The measurement answered yes, so the same machinery is offered from a meeting
+page: pick a model, press start, watch lines arrive. `server/live.py` holds it,
+and the reason it is a module of its own rather than a few lines inside the
+recorder is that live has to work when this process is not the one recording.
+
+**Output goes to `live/`, a sibling of `recordings/`, never inside it.**
+`recordings/` is read-only for everything except the recorders. The meeting page
+counts clips per source from that folder, and `processing.py` keys its caches on
+what it holds, so one extra file in there re-labels the meeting, invalidates
+artifacts and offers to re-transcribe work that was already done. A live copy
+dropped beside the originals would do exactly that. `live/` holds
+`live-transcript.txt`, `state.json` and `clips/`, and nothing downstream reads
+it.
+
+**Clips are found by scanning, not pushed by the recorder.** A callback on
+`SourceRecorder` was the obvious design and is wrong: the Discord receiver is a
+separate Node process writing into the same folder, so half of a Discord meeting
+would never reach the model. The filename contract is the one thing every
+producer shares, so discovery goes through it - `timestamp_from_discord_wav`
+decides what is new, `source_name_from_discord_wav` decides who said it. That
+also keeps live off the recorder threads entirely, which matters because a
+stalled recorder loses audio that cannot be recovered; live can be started,
+stopped and pointed at a different model without any of them noticing. The
+found clip is then *copied* into `live/clips/`, so what was actually fed to the
+live model survives the original being moved to `processed/`.
+
+**A clip is ready when it is a second old and its header agrees with its
+size.** Both recorders write a whole WAV in one go once the silence gate closes
+it - the write itself measures 1-2 ms here - so there is no window in which a
+file sits half-written for long. An mtime at least `MIN_CLIP_AGE` old covers
+that window with three orders of magnitude to spare, and the header check
+(`nframes > 0`, `st_size >= 44 + nframes * nchannels * sampwidth`) catches the
+case where it does not, because a file caught mid-write claims more audio than
+it has. Anything that raises while checking means "not ready, try next scan",
+never "seen": marking a clip seen on an error silently drops an utterance, and
+nothing would ever say so. A lock file or a write-then-rename protocol would be
+stronger and would need every producer to cooperate, including the Node
+receiver - not worth it for a window this small.
+
+**Start, stop and catch up.** Starting sets a watermark: only clips whose
+filename timestamp is at or after it are eligible, so pressing start in the
+middle of a meeting does not replay the first hour. Stopping ends the scan, lets
+the clip already inside the model finish, and drops the queue *without* marking
+those clips seen - so `catch_up` picks them up rather than the user waiting out
+a backlog they no longer want. `state.json` carries the watermark, the model and
+the seen filenames across both a stop and a server restart, which is what makes
+"Resume (catch up)" mean "everything since I first pressed start", and what
+makes changing model free: stop, pick another, catch up. A clip joins `seen`
+only once the worker is finished with it, line or silence alike. One session
+runs at a time for the whole dashboard, because what is being shared is the GPU.
+
+**The fake transcriber.** With `AVILISTENER_LIVE_FAKE_TRANSCRIBER=1` the manager
+is built with `FakeLiveTranscriber`, which loads no model and answers
+`simulated transcript of <source> clip`. It exists so the Playwright suite (and
+a developer poking at the interface) can exercise the whole path without a GPU
+or a model download. The variable is read in exactly one place, where the
+manager is constructed in `server/app.py`, so the offline pipeline can never
+pick it up by accident.
+
+Routes, all under `/api/projects/{p}/meetings/{m}`: `GET live` (status plus
+lines after an index), `POST live/start`, `POST live/stop`, and
+`GET live/transcript` for the raw file. The meeting payload carries the same
+status object without lines, so opening a page already knows. `GET /api/live` is
+the global one, like `/api/recording`.
 
 ## Why PC audio, and not an integration with the meeting app
 
