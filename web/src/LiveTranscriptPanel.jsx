@@ -21,6 +21,26 @@ export function formatLiveLine(line) {
   return time ? `[${time}] ${body}` : body;
 }
 
+// Deliberately the same shape as the backend's `_LINE_PATTERN`: the source is
+// the shortest run up to the first ": ", so a colon inside the speech stays in
+// the text. One format, written in one place and read back in one place.
+const LIVE_LINE_PATTERN = /^\[(\d{2}:\d{2}:\d{2})\] (.*?): (.*)$/;
+// A line that lost its stamp (hand-edited, or a future producer) still has a
+// speaker worth showing, so it is parsed with an empty time rather than dropped.
+const UNSTAMPED_LINE_PATTERN = /^(.*?): (.*)$/;
+
+// The inverse of `formatLiveLine`, for text read back from live-transcript.txt.
+// A line that matches neither shape comes back as text alone, with no source -
+// which is how the caller knows to render it across the whole row.
+export function parseLiveLine(text) {
+  const raw = text ?? "";
+  const stamped = LIVE_LINE_PATTERN.exec(raw);
+  if (stamped) return { time: stamped[1], source: stamped[2], text: stamped[3] };
+  const plain = UNSTAMPED_LINE_PATTERN.exec(raw);
+  if (plain && plain[1]) return { time: "", source: plain[1], text: plain[2] };
+  return { time: "", source: "", text: raw };
+}
+
 function statusLabel(status) {
   if (!status) return "…";
   const parts = [
@@ -42,6 +62,7 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
   const [busy, setBusy] = useState(false);
   const [model, setModel] = useState(live?.model_size || live?.default_model || "");
   const after = useRef(0);
+  const polling = useRef(false);
   const logRef = useRef(null);
   const followTail = useRef(true);
   // Mirrors followTail for rendering: a ref does not re-render, and the
@@ -50,10 +71,19 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
   const wasActive = useRef(false);
 
   const poll = useCallback(async () => {
+    // The 1200 ms timer and the poll inside `runAction` can land together.
+    // Both would read the same cursor before awaiting and both would append,
+    // so the log showed every line twice. One reader at a time.
+    if (polling.current) return null;
+    polling.current = true;
+    const from = after.current;
     try {
-      const data = await api.live(project, meeting, after.current);
+      const data = await api.live(project, meeting, from);
       setStatus(data);
       setError(null);
+      // Start/stop moved the cursor while this request was in the air, so what
+      // came back describes a stream that is no longer the one on screen.
+      if (after.current !== from) return data;
       // A fresh session numbers its lines from zero again, so a total below
       // our cursor means the stream restarted: rewind and read it from 0.
       if (typeof data.lines_total === "number" && data.lines_total < after.current) {
@@ -61,14 +91,19 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
         setLines([]);
         return data;
       }
-      if (data.lines?.length) {
-        after.current = data.lines[data.lines.length - 1].index + 1;
-        setLines((current) => [...current, ...data.lines]);
+      // Appending is idempotent on the index: anything at or below the cursor
+      // has been rendered already, whoever fetched it.
+      const fresh = (data.lines || []).filter((line) => line.index >= after.current);
+      if (fresh.length) {
+        after.current = fresh[fresh.length - 1].index + 1;
+        setLines((current) => [...current, ...fresh]);
       }
       return data;
     } catch (err) {
       setError(err.message);
       return null;
+    } finally {
+      polling.current = false;
     }
   }, [project, meeting]);
 
@@ -199,7 +234,7 @@ export default function LiveTranscriptPanel({ project, meeting, live, onChanged 
       ) : null}
 
       <div className="live-log-wrap">
-        <div className="log live-log" ref={logRef} onScroll={onScroll}>
+        <div className="log live-log scroll-dark" ref={logRef} onScroll={onScroll}>
           {lines.length
             ? lines.map((line) => <div key={line.index}>{formatLiveLine(line)}</div>)
             : active

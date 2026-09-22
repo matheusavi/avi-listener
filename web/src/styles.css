@@ -127,19 +127,26 @@ input, select {
   color: var(--muted); margin-top: 10px;
 }
 
-/* The live log is bounded so a long session never pushes the rest of the page
-   away; it scrolls inside, with a scrollbar that is visible on the dark theme
-   and a way back to the newest line after reading older ones. */
-.live-log-wrap { position: relative; }
-.live-log {
-  max-height: 40vh; min-height: 120px;
-  overflow-y: scroll; scrollbar-gutter: stable;
+/* A scroll box whose scrollbar is actually visible on the dark theme: the
+   browser default is nearly invisible against the panel, so a bounded region
+   looks like it simply lost its content. Shared by every such region. */
+.scroll-dark {
+  overflow-y: auto; scrollbar-gutter: stable;
   color-scheme: dark; scrollbar-color: #3a4150 #0b0d11;
 }
-.live-log::-webkit-scrollbar { width: 12px; }
-.live-log::-webkit-scrollbar-track { background: #0b0d11; border-radius: 8px; }
-.live-log::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 8px; border: 2px solid #0b0d11; }
-.live-log::-webkit-scrollbar-thumb:hover { background: #4b5468; }
+.scroll-dark::-webkit-scrollbar { width: 12px; }
+.scroll-dark::-webkit-scrollbar-track { background: #0b0d11; border-radius: 8px; }
+.scroll-dark::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 8px; border: 2px solid #0b0d11; }
+.scroll-dark::-webkit-scrollbar-thumb:hover { background: #4b5468; }
+
+/* The live log is bounded so a long session never pushes the rest of the page
+   away; it scrolls inside, with a way back to the newest line after reading
+   older ones. `scroll` rather than `auto`: the bar is there from the first
+   line, so the log never reflows the moment it overflows. */
+.live-log-wrap { position: relative; }
+.live-log { max-height: 40vh; min-height: 120px; overflow-y: scroll; }
+/* The Live tab shows the same transcript, read back from the file. */
+.live-transcript { max-height: 60vh; }
 .live-jump {
   position: absolute; right: 24px; bottom: 12px;
   font-size: 12px; padding: 5px 10px; border-radius: 999px;

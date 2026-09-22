@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { prepareChromeTabCapture } from "./chromeTabCapture.js";
-import LiveTranscriptPanel from "./LiveTranscriptPanel.jsx";
+import LiveTranscriptPanel, { parseLiveLine } from "./LiveTranscriptPanel.jsx";
 import Speakers from "./Speakers.jsx";
 import { api } from "./api.js";
 
@@ -158,11 +158,16 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
     [projectSlug, meetingSlug]
   );
 
+  // A growing live transcript is a reason to refetch only the Live tab; left
+  // unguarded it re-requested the merged transcript once every poll for the
+  // whole of a live session.
+  const liveLinesForTab = tab === "live" ? meeting?.live?.lines_total : null;
+
   useEffect(() => {
     if (!meeting) return;
     showTab(tab);
   }, [tab, showTab, meeting?.artifacts.has_merged, meeting?.artifacts.has_diarized, meeting?.artifacts.has_transcripts,
-      meeting?.jobs?.[0]?.finished_at, meeting?.live?.lines_total]);
+      meeting?.jobs?.[0]?.finished_at, liveLinesForTab]);
 
   const act = async (fn) => {
     setError(null);
@@ -491,23 +496,30 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
             ))}
           </div>
           {tab === "live" ? (
-            <div className="transcript">
-              {liveText.trim() ? (
-                liveText.trimEnd().split("\n").map((line, index) => {
-                  // Live lines are "[HH:MM:SS] source: text", not the pipe-separated merged format.
-                  const match = line.match(/^\[(.+?)\]\s*([^:]+):\s*(.*)$/);
-                  if (!match) return <div key={index} className="line"><div className="what" style={{ gridColumn: "1 / -1" }}>{line}</div></div>;
-                  return (
-                    <div key={index} className="line">
-                      <div className="time">{match[1]}</div>
-                      <div className="who">{match[2]}</div>
-                      <div className="what">{match[3]}</div>
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="empty">Nothing transcribed live yet.</div>
-              )}
+            // Bounded like the live panel's own log: a long session must not
+            // push the rest of the page out of reach.
+            <div className="scroll-dark live-transcript">
+              <div className="transcript">
+                {liveText.trim() ? (
+                  liveText.trimEnd().split("\n").map((line, index) => {
+                    // Live lines are "[HH:MM:SS] source: text", not the pipe-separated
+                    // merged format. Parsed by the panel that writes that format.
+                    const parsed = parseLiveLine(line);
+                    if (!parsed.source) {
+                      return <div key={index} className="line"><div className="what" style={{ gridColumn: "1 / -1" }}>{parsed.text}</div></div>;
+                    }
+                    return (
+                      <div key={index} className="line">
+                        <div className="time">{parsed.time}</div>
+                        <div className="who">{parsed.source}</div>
+                        <div className="what">{parsed.text}</div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="empty">Nothing transcribed live yet.</div>
+                )}
+              </div>
             </div>
           ) : tab === "logs" ? (
             <>

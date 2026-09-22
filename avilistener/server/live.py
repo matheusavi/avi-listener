@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -49,7 +50,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from avilistener.file_transcriber import source_name_from_discord_wav, timestamp_from_discord_wav
+from avilistener.file_transcriber import (
+    sort_key_for_discord_wav,
+    source_name_from_discord_wav,
+    timestamp_from_discord_wav,
+)
 from avilistener.live import LiveLine, LiveTranscriber
 from avilistener.server.workspace import Meeting
 
@@ -94,12 +99,43 @@ def format_transcript_line(source: str, text: str, started_at: float) -> str:
     Local rather than UTC because the only reason to read this file is to
     follow a conversation that is happening now.
     """
-    return f"[{clock(started_at)}] {source}: {text}"
+    return f"[{clock_label(started_at)}] {source}: {text}"
 
 
-def clock(started_at: float) -> str:
-    """`HH:MM:SS` in local time, the one field a parsed-back line keeps."""
+def clock_label(started_at: float) -> str:
+    """`HH:MM:SS` in local time, the one field a parsed-back line keeps.
+
+    Named `clock_label` rather than `clock` because a session carries an
+    injected `self.clock` time source, and one name for two unrelated things
+    is how a test ends up asserting against the wrong one.
+    """
     return datetime.fromtimestamp(started_at).strftime("%H:%M:%S")
+
+
+def line_entry(
+    index: int,
+    time: str,
+    source: str,
+    text: str,
+    started_at: float = 0.0,
+    ended_at: float = 0.0,
+    latency: float = 0.0,
+) -> dict:
+    """One line as the dashboard receives it.
+
+    Built in one place because a line reconstructed from the transcript file
+    and a line straight off the worker must have exactly the same keys: the
+    interface renders both from the same list.
+    """
+    return {
+        "index": index,
+        "time": time,
+        "source": source,
+        "text": text,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "latency": latency,
+    }
 
 
 def parse_transcript(path: Path) -> list[dict]:
@@ -118,17 +154,7 @@ def parse_transcript(path: Path) -> list[dict]:
             continue
         match = _LINE_PATTERN.match(text)
         stamp, source, body = (match.group(1), match.group(2), match.group(3)) if match else ("", "", text)
-        lines.append(
-            {
-                "index": len(lines),
-                "time": stamp,
-                "source": source,
-                "text": body,
-                "started_at": 0.0,
-                "ended_at": 0.0,
-                "latency": 0.0,
-            }
-        )
+        lines.append(line_entry(len(lines), stamp, source, body))
     return lines
 
 
@@ -267,7 +293,17 @@ class LiveSession:
             self.watermark = float(clock())
 
         self._lock = threading.Lock()
+        # A separate lock for `state.json`, held across build *and* write.
+        # `self._lock` guards the scan hot path and every callback from the
+        # worker, so holding it over disk I/O would stall discovery; a lock of
+        # its own is what stops two writers (the worker's `_on_clip_done` and
+        # the request thread's `stop`) from interleaving a stale payload over a
+        # newer one. Order is always _state_lock -> _lock, never the reverse.
+        self._state_lock = threading.Lock()
         self._seen: set[str] = {str(name) for name in state.get("seen") or []}
+        # Filenames already complained about, so an unreadable name is logged
+        # once rather than once per scan for the life of the session.
+        self._unparsable: set[str] = set()
         # Submitted but not finished. Kept apart from `seen` so a clip dropped
         # by a stop is offered again rather than silently lost.
         self._queued: set[str] = set()
@@ -306,7 +342,10 @@ class LiveSession:
         if thread is not None:
             thread.join(timeout=self.stop_timeout)
 
-        live, self._live = self._live, None
+        # The reference is dropped only after the drain: `snapshot` reads it,
+        # and nulling it first made the dashboard show zeros for as long as the
+        # clip already inside the model took to finish - up to a minute.
+        live = self._live
         if live is not None:
             # drain=False: queued clips are not marked seen, so `catch_up`
             # picks them up instead of the user waiting out a backlog.
@@ -318,6 +357,7 @@ class LiveSession:
                 "average_latency": live.average_latency,
                 "max_latency": live.max_latency,
             }
+            self._live = None
         with self._lock:
             if self._status != "error":
                 self._status = "stopped"
@@ -364,13 +404,19 @@ class LiveSession:
             self._stop.wait(self.scan_interval)
 
     def _scan(self) -> None:
+        # A stop that timed out drops the transcriber while this loop may still
+        # be between iterations, so the reference is taken once and checked.
+        live = self._live
         directory = self.meeting.recordings_dir
-        if not directory.exists():
+        if live is None or not directory.exists():
             self.scans += 1
             return
         # Top level only: `continuous/` holds hour-long session files and
         # `processed/` holds clips the offline pipeline already consumed.
-        for path in sorted(directory.glob("*.wav")):
+        # Sorted by the timestamp in the name, not by the name itself: the
+        # Discord receiver and the local recorder use different prefixes, so
+        # plain name order would transcribe an interleaved meeting per source.
+        for path in sorted(directory.glob("*.wav"), key=_scan_order):
             if self._stop.is_set():
                 break
             if not self._eligible(path):
@@ -380,7 +426,7 @@ class LiveSession:
                 continue
             with self._lock:
                 self._queued.add(path.name)
-            self._live.submit(source_name_from_discord_wav(path), copy, 0.0)
+            live.submit(source_name_from_discord_wav(path), copy, 0.0)
         self.scans += 1
 
     def _eligible(self, path: Path) -> bool:
@@ -391,7 +437,10 @@ class LiveSession:
             if name in self._seen or name in self._queued:
                 return False
         started_at = timestamp_from_discord_wav(path)
-        if started_at is None or started_at < self.watermark:
+        if started_at is None:
+            self._warn_unparsable(name)
+            return False
+        if started_at < self.watermark:
             return False
         try:
             if not path.is_file():
@@ -400,10 +449,30 @@ class LiveSession:
             if self.clock() - stat.st_mtime < self.min_clip_age:
                 return False
             return _wav_is_complete(path, stat.st_size)
-        except (OSError, wave.Error):
-            # Being written, locked by the other process, or half a header.
-            # Not seen: the next scan tries again.
+        except Exception:
+            # Being written, locked by the other process, half a header, or
+            # zero bytes (which `wave.open` reports as EOFError, not wave.Error).
+            # A clip that cannot be inspected is by definition not ready, and
+            # anything narrower would abort the rest of the scan cycle over one
+            # bad file. Not marked seen: the next scan tries again.
             return False
+
+    def _warn_unparsable(self, name: str) -> None:
+        """Say so once per filename: a clip nobody can date is never picked up.
+
+        Silence here is the worst outcome - the utterance is simply missing
+        from the live transcript with nothing anywhere to explain the gap.
+        """
+        with self._lock:
+            if name in self._unparsable:
+                return
+            self._unparsable.add(name)
+        logger.warning(
+            "Live: ignoring %s in %s - no timestamp in the filename, so it cannot be placed "
+            "against the watermark",
+            name,
+            self.key,
+        )
 
     def _copy_for_live(self, path: Path) -> Path | None:
         destination = self.meeting.live_clips_dir / path.name
@@ -420,16 +489,17 @@ class LiveSession:
     # -- callbacks from the transcriber worker -----------------------------
     def _on_line(self, line: LiveLine) -> None:
         with self._lock:
-            entry = {
-                "index": len(self._lines),
-                "time": clock(line.started_at),
-                "source": line.source,
-                "text": line.text,
-                "started_at": line.started_at,
-                "ended_at": line.ended_at,
-                "latency": line.latency,
-            }
-            self._lines.append(entry)
+            self._lines.append(
+                line_entry(
+                    index=len(self._lines),
+                    time=clock_label(line.started_at),
+                    source=line.source,
+                    text=line.text,
+                    started_at=line.started_at,
+                    ended_at=line.ended_at,
+                    latency=line.latency,
+                )
+            )
         self._append_transcript(line)
 
     def _on_clip_error(self, path: Path, exc: Exception) -> None:
@@ -464,19 +534,36 @@ class LiveSession:
             logger.warning("Could not append to %s: %s", path, exc)
 
     def _persist_state(self) -> None:
-        with self._lock:
-            payload = {
-                "watermark": self.watermark,
-                "model_size": self.model_size,
-                "seen": sorted(self._seen),
-                "lines_total": len(self._lines),
-            }
+        """Replace `state.json` atomically, one writer at a time.
+
+        Two threads write it - the worker as each clip finishes and the request
+        thread on stop - and a reader can arrive at any moment. A plain
+        `write_text` truncates first, so a reader could see an empty or partial
+        file, and two interleaved writers could leave the older `seen` set on
+        disk. Writing a sibling temp file and `os.replace`-ing it makes the
+        swap atomic for readers, and `_state_lock` (held across build and
+        write, so the payload cannot be overtaken) makes it atomic for writers.
+        """
         path = self.meeting.live_state_path
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError as exc:
-            logger.warning("Could not write %s: %s", path, exc)
+        temp = path.with_name(path.name + ".tmp")
+        with self._state_lock:
+            with self._lock:
+                payload = {
+                    "watermark": self.watermark,
+                    "model_size": self.model_size,
+                    "seen": sorted(self._seen),
+                    "lines_total": len(self._lines),
+                }
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                _replace_when_free(temp, path)
+            except OSError as exc:
+                logger.warning("Could not write %s: %s", path, exc)
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     # -- reporting ---------------------------------------------------------
     def snapshot(self, after: int = 0) -> LiveStatus:
@@ -509,6 +596,39 @@ class LiveSession:
                 lines=lines,
                 error=self._error,
             )
+
+
+def _replace_when_free(temp: Path, path: Path, attempts: int = 40, pause: float = 0.005) -> None:
+    """`os.replace`, retried while a reader still holds the destination open.
+
+    On Windows the swap fails with a sharing violation for as long as anything
+    has the target open, and the dashboard polls `state.json` - so the very act
+    of watching a live session could throw a write away. A lost write means a
+    clip is transcribed again after a restart, which is exactly what `seen`
+    exists to prevent, so a fifth of a second of patience is worth the retry.
+    On POSIX the first attempt always succeeds and this costs nothing.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+
+
+def _scan_order(path: Path) -> tuple[float, str]:
+    """`sort_key_for_discord_wav`, tolerant of a clip that vanished mid-scan.
+
+    The key falls back to `st_mtime` for a name it cannot parse, and a file
+    moved to `processed/` between the glob and the sort would raise there -
+    losing the whole cycle over a clip that is no longer any of our business.
+    """
+    try:
+        return sort_key_for_discord_wav(path)
+    except OSError:
+        return (0.0, path.name)
 
 
 def _wav_is_complete(path: Path, size: int) -> bool:

@@ -10,6 +10,7 @@ than lost, and that `recordings/` comes out byte for byte as it went in.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -27,7 +28,8 @@ from avilistener.server.live import (
     FakeLiveTranscriber,
     LiveBusy,
     LiveManager,
-    clock,
+    LiveSession,
+    clock_label,
     parse_transcript,
 )
 from avilistener.server.workspace import Workspace
@@ -316,6 +318,59 @@ class TestDiscovery:
         os.utime(clip, (BASE + 10, BASE + 10))
         wait_for(lambda: env.transcriber.count == 1, "the finished clip was never retried")
 
+    def test_a_zero_byte_clip_is_retried_and_does_not_stop_the_scan(self, env) -> None:
+        """A 0-byte WAV raises EOFError, which is neither OSError nor wave.Error.
+
+        It used to escape the readiness check and abort the whole scan cycle,
+        so every clip behind it went untranscribed for as long as it sat there.
+        """
+        env.meeting.recordings_dir.mkdir(parents=True, exist_ok=True)
+        empty = env.meeting.recordings_dir / segment_filename(BASE + 10, "mic")
+        empty.write_bytes(b"")
+        os.utime(empty, (BASE + 10, BASE + 10))
+        # Sorts after the empty one, so it is only reached if the scan survives.
+        env.clip("system", BASE + 20)
+
+        manager = env.manager()
+        manager.start(env.meeting)
+        env.wait_running(manager)
+        env.clock.advance(60)
+
+        wait_for(
+            lambda: env.transcriber.clips == ["system"],
+            "the valid clip behind the empty one was never reached",
+        )
+        env.wait_scans(manager, count=5)
+        assert empty.name not in state_of(env.meeting)["seen"], "an unreadable clip must not be marked seen"
+
+        # The producer finishes writing it; the next scan finds a real clip.
+        write_wav(empty, tone(0.3), 16000)
+        os.utime(empty, (BASE + 10, BASE + 10))
+        wait_for(
+            lambda: sorted(env.transcriber.clips) == ["mic", "system"],
+            "the rewritten clip was never picked up",
+        )
+
+    def test_a_filename_with_no_timestamp_is_logged_once(self, env, caplog) -> None:
+        """Dropping it silently leaves a gap nothing in the log explains."""
+        env.meeting.recordings_dir.mkdir(parents=True, exist_ok=True)
+        stray = env.meeting.recordings_dir / "handwritten-note.wav"
+        write_wav(stray, tone(0.3), 16000)
+        os.utime(stray, (BASE, BASE))
+        env.clip("mic", BASE + 10)
+
+        with caplog.at_level(logging.WARNING, logger="avilistener.server.live"):
+            manager = env.manager()
+            manager.start(env.meeting)
+            env.wait_running(manager)
+            env.clock.advance(60)
+            wait_for(lambda: env.transcriber.count == 1, "the real clip never arrived")
+            env.wait_scans(manager, count=5)
+
+        complaints = [record for record in caplog.records if stray.name in record.getMessage()]
+        assert len(complaints) == 1, "the same unreadable name was logged once per scan"
+        assert env.transcriber.clips == ["mic"], "a clip with no timestamp must not be transcribed"
+
     def test_continuous_and_pcm_files_are_ignored(self, env) -> None:
         env.meeting.continuous_dir.mkdir(parents=True, exist_ok=True)
         session_file = env.meeting.continuous_dir / continuous_filename(BASE + 10, "system")
@@ -419,7 +474,7 @@ class TestTranscriptAndStatus:
         assert status["lines"][0]["source"] == "mic"
         assert status["lines"][0]["text"] == "text from mic"
         assert status["lines"][0]["latency"] == 0.0
-        assert status["lines"][0]["time"] == clock(BASE + 10), "the clock survives via the file, not started_at"
+        assert status["lines"][0]["time"] == clock_label(BASE + 10), "the clock survives via the file, not started_at"
         assert restarted.global_status() == {"active": False, "meeting": None, "status": "stopped"}
 
     def test_lines_keep_their_index_across_a_restart(self, env) -> None:
@@ -521,6 +576,127 @@ class TestManagerLifecycle:
         assert fake.transcribe(chunk).text == "simulated transcript of mic clip"
         empty = AudioChunk(source="mic", audio=np.zeros(0, dtype=np.float32), sample_rate=16000, started_at=BASE, ended_at=BASE, rms=0.0)
         assert fake.transcribe(empty) is None
+
+
+class TestStateFile:
+    """`state.json` has two writers and a reader that can arrive any moment."""
+
+    def test_two_writers_leave_a_whole_file_and_lose_nothing(self, env) -> None:
+        session = LiveSession(
+            meeting=env.meeting,
+            model_size="tiny",
+            mode="now",
+            config={},
+            transcriber_factory=lambda config: env.transcriber,
+            clock=env.clock,
+        )
+        names = [f"{index:04d}-clip.wav" for index in range(300)]
+        halves = (names[::2], names[1::2])
+        damage: list[str] = []
+        stop_reading = threading.Event()
+
+        def write(chunk: list[str]) -> None:
+            for name in chunk:
+                with session._lock:
+                    session._seen.add(name)
+                session._persist_state()
+
+        def read() -> None:
+            while not stop_reading.is_set():
+                # A poller, like the dashboard, rather than a spin loop: on
+                # Windows an open handle blocks the writers' swap outright.
+                time.sleep(0.001)
+                try:
+                    payload = json.loads(env.meeting.live_state_path.read_text(encoding="utf-8"))
+                except OSError:
+                    continue  # not written yet, or mid-swap: try again
+                except ValueError as exc:
+                    damage.append(f"half-written state.json: {exc}")
+                    return
+                if not isinstance(payload.get("seen"), list):
+                    damage.append(f"unexpected payload: {payload}")
+                    return
+
+        reader = threading.Thread(target=read, name="state-reader", daemon=True)
+        reader.start()
+        writers = [threading.Thread(target=write, args=(chunk,), daemon=True) for chunk in halves]
+        for thread in writers:
+            thread.start()
+        for thread in writers:
+            thread.join(TIMEOUT)
+            assert not thread.is_alive(), "a writer never finished"
+        stop_reading.set()
+        reader.join(TIMEOUT)
+
+        assert damage == [], "a reader saw state.json mid-write"
+        assert set(state_of(env.meeting)["seen"]) == set(names), "one writer overwrote the other's clips"
+        temp = env.meeting.live_state_path.with_name(env.meeting.live_state_path.name + ".tmp")
+        assert not temp.exists(), "the temp file was left behind"
+
+
+class TestStoppingWhileAClipIsInTheModel:
+    """A stop waits out the clip already inside the model - up to a minute."""
+
+    class BlockingTranscriber:
+        """Finishes the first clip, then holds the second until released."""
+
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.lock = threading.Lock()
+            self.clips: list[str] = []
+
+        def transcribe(self, chunk) -> TranscriptResult:
+            with self.lock:
+                self.clips.append(chunk.source)
+                first = len(self.clips) == 1
+            if not first:
+                self.entered.set()
+                self.release.wait(TIMEOUT)
+            return TranscriptResult(
+                source=chunk.source,
+                text=f"text from {chunk.source}",
+                started_at=chunk.started_at,
+                ended_at=chunk.ended_at,
+                rms=chunk.rms,
+            )
+
+    def test_the_status_keeps_its_lines_and_counters_during_the_drain(self, env) -> None:
+        blocking = self.BlockingTranscriber()
+        manager = env.manager(factory=lambda config: blocking)
+        env.clip("mic", BASE + 10)
+        manager.start(env.meeting)
+        env.wait_running(manager)
+        env.clock.advance(30)
+        wait_for(lambda: manager.status(env.meeting)["lines_total"] == 1, "the first clip never arrived")
+
+        env.clip("system", BASE + 40)
+        env.clock.advance(30)
+        assert blocking.entered.wait(TIMEOUT), "the second clip never reached the model"
+
+        session = manager.session
+        scan_thread = session._thread
+        stopping = threading.Thread(target=lambda: manager.stop(env.meeting), name="stopper", daemon=True)
+        stopping.start()
+        try:
+            wait_for(lambda: not scan_thread.is_alive(), "the stop never got past the scan loop")
+            time.sleep(0.2)  # the stop is now inside the drain, waiting on the model
+
+            status = manager.status(env.meeting)
+            assert status["clips_transcribed"] == 1, "stop flashed the counters to zero while draining"
+            assert status["lines_total"] == 1
+            assert status["lines"][0]["text"] == "text from mic"
+            assert status["model_size"] == session.model_size, "the model must stay readable during the drain"
+            assert status["pending"] == 1, "the clip inside the model is still pending"
+        finally:
+            blocking.release.set()
+
+        stopping.join(TIMEOUT)
+        assert not stopping.is_alive(), "the stop never returned"
+        final = manager.status(env.meeting)
+        assert final["status"] == "stopped"
+        assert final["active"] is False
+        assert final["lines_total"] == 2, "the clip that finished during the drain was dropped"
 
 
 class TestLiveFilesDoNotDisturbTheOfflinePipeline:
