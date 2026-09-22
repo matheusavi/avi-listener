@@ -101,6 +101,8 @@ With a bot in the voice channel, Discord already tells us who is speaking, so ea
 
 Open the session page and press **Start live** in the **Live transcript** panel, picking a smaller model if you want the lines sooner. It runs beside the recording rather than as part of it: start and stop it whenever you like, and the normal Transcribe / Split / Merge steps still produce the real transcript afterwards.
 
+![Live transcript filling up while a session is recorded](docs/live-transcript-flow.gif)
+
 Every line is appended to `live/live-transcript.txt` inside the session folder, a plain text file that grows as people talk. Point Claude Desktop, Codex or any agent with file access at it and you can ask what was just decided, who objected, or what you missed while you were away. With the Discord bot the lines already carry participant names; PC audio is labelled `system` until the offline speaker split sorts it out.
 
 
