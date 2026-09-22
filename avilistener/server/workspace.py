@@ -144,6 +144,26 @@ class Meeting:
     def continuous_dir(self) -> Path:
         return self.recordings_dir / "continuous"
 
+    # Live transcription output. Deliberately a sibling of `recordings/` and
+    # never inside it: `recordings/` is the read-only source of truth that the
+    # offline pipeline hashes and counts, so a live copy dropped in there would
+    # be transcribed twice and would make every recording comparison stale.
+    @property
+    def live_dir(self) -> Path:
+        return self.path / "live"
+
+    @property
+    def live_clips_dir(self) -> Path:
+        return self.live_dir / "clips"
+
+    @property
+    def live_transcript_path(self) -> Path:
+        return self.live_dir / "live-transcript.txt"
+
+    @property
+    def live_state_path(self) -> Path:
+        return self.live_dir / "state.json"
+
     @property
     def transcripts_dir(self) -> Path:
         return self.path / "transcripts"

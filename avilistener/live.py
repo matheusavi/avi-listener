@@ -64,6 +64,12 @@ class LiveTranscriber:
     `transcriber` is duck-typed: anything with `transcribe(chunk)` returning a
     result with `.text` (or None) works, which keeps the tests free of a real
     Whisper model.
+
+    `on_done` is called with the clip's path once the worker has finished with
+    it, whether it produced a line, was skipped as silent or failed. A caller
+    that remembers which clips are already handled needs that moment and only
+    that moment: a clip abandoned by `stop(drain=False)` is never announced, so
+    it can be picked up again on the next session.
     """
 
     def __init__(
@@ -71,10 +77,12 @@ class LiveTranscriber:
         transcriber,
         on_line: Callable[[LiveLine], None],
         on_error: Callable[[Path, Exception], None] | None = None,
+        on_done: Callable[[Path], None] | None = None,
     ) -> None:
         self.transcriber = transcriber
         self.on_line = on_line
         self.on_error = on_error
+        self.on_done = on_done
 
         self.lines_emitted = 0
         self.clips_skipped = 0
@@ -155,6 +163,11 @@ class LiveTranscriber:
             finally:
                 with self._lock:
                     self._pending -= 1
+                if self.on_done is not None:
+                    try:
+                        self.on_done(path)
+                    except Exception:  # bookkeeping must not end the worker
+                        logger.warning("Live on_done failed for %s", path, exc_info=True)
 
     def _transcribe(self, source_name: str, path: Path) -> None:
         chunk = wav_to_audio_chunk(source_name, path)

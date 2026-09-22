@@ -15,11 +15,12 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from avilistener.server.jobs import DiscordReceiver, JobRegistry, RecordingManager, discord_token_in_environment
+from avilistener.server.live import FakeLiveTranscriber, LiveBusy, LiveManager, build_transcriber
 from avilistener.server.workspace import DEFAULT_PROJECT_CONFIG, Meeting, Workspace, public_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -33,6 +34,15 @@ workspace = Workspace(root=WORKSPACE_ROOT)
 jobs = JobRegistry()
 recorder = RecordingManager()
 discord = DiscordReceiver(project_root=PROJECT_ROOT)
+# The one place the fake is chosen, so a dev or e2e run can watch the live view
+# fill up without a GPU and the offline pipeline can never see the flag.
+live = LiveManager(
+    transcriber_factory=(
+        FakeLiveTranscriber
+        if os.environ.get("AVILISTENER_LIVE_FAKE_TRANSCRIBER") == "1"
+        else build_transcriber
+    )
+)
 
 app = FastAPI(title="AviListener")
 app.add_middleware(
@@ -71,6 +81,11 @@ class CombineIn(BaseModel):
 
 class ConfigIn(BaseModel):
     config: dict[str, Any]
+
+
+class LiveStartIn(BaseModel):
+    model_size: str | None = None  # falls back to the meeting's model
+    mode: str | None = None  # "now" (default) or "catch_up"
 
 
 def _meeting_or_404(project_slug: str, meeting_slug: str) -> Meeting:
@@ -204,6 +219,9 @@ def get_meeting(project_slug: str, meeting_slug: str) -> dict:
         "discord": _discord_status_for(meeting),
         "discord_available": bool(meeting.config.get("discord_token")) or discord_token_in_environment(),
         "recording": status if status and status.get("meeting") == _key(meeting) else None,
+        # Without the lines: this payload is refetched whenever anything about
+        # the meeting changes, and a long live transcript does not belong in it.
+        "live": live.status(meeting, with_lines=False),
         "active_job": active.to_json() if active else None,
         "jobs": [job.to_json() for job in jobs.recent(_key(meeting), limit=8)],
     }
@@ -291,6 +309,44 @@ async def push_chrome_audio(
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
     return {"frames": frames}
+
+
+@app.get("/api/live")
+def live_status_global() -> dict:
+    """Global, like /api/recording: only one live session exists at a time."""
+    return live.global_status()
+
+
+@app.get("/api/projects/{project_slug}/meetings/{meeting_slug}/live")
+def live_status(project_slug: str, meeting_slug: str, after: int = 0) -> dict:
+    meeting = _meeting_or_404(project_slug, meeting_slug)
+    return live.status(meeting, after=after)
+
+
+@app.post("/api/projects/{project_slug}/meetings/{meeting_slug}/live/start")
+def live_start(project_slug: str, meeting_slug: str, payload: LiveStartIn) -> dict:
+    meeting = _meeting_or_404(project_slug, meeting_slug)
+    try:
+        return live.start(meeting, model_size=payload.model_size, mode=payload.mode or "now")
+    except LiveBusy as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/projects/{project_slug}/meetings/{meeting_slug}/live/stop")
+def live_stop(project_slug: str, meeting_slug: str) -> dict:
+    """Always 200: stopping something that is not running is what the user
+    wanted anyway, and the interface should not have to know which it was."""
+    meeting = _meeting_or_404(project_slug, meeting_slug)
+    return live.stop(meeting)
+
+
+@app.get("/api/projects/{project_slug}/meetings/{meeting_slug}/live/transcript")
+def live_transcript(project_slug: str, meeting_slug: str) -> PlainTextResponse:
+    """The raw file, so it can be tailed, saved or pasted without unwrapping."""
+    meeting = _meeting_or_404(project_slug, meeting_slug)
+    return PlainTextResponse(live.transcript_text(meeting))
 
 
 @app.post("/api/projects/{project_slug}/meetings/{meeting_slug}/transcribe")

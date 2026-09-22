@@ -12,6 +12,15 @@ async function request(path, options = {}) {
   return response.json();
 }
 
+async function textRequest(path) {
+  const response = await fetch(`/api${path}`);
+  if (!response.ok) {
+    const problem = await response.json().catch(() => ({}));
+    throw new Error(problem.detail || `${response.status} ${response.statusText}`);
+  }
+  return response.text();
+}
+
 async function binaryRequest(path, body) {
   const response = await fetch(`/api${path}`, {
     method: "POST",
@@ -46,6 +55,20 @@ export const api = {
     ),
   stopRecording: (project, meeting) =>
     request(`/projects/${project}/meetings/${meeting}/record/stop`, { method: "POST" }),
+
+  // Live transcription runs beside the offline pipeline: `after` is the index
+  // of the first line we have not seen, so polling only carries new lines.
+  live: (project, meeting, after = 0) =>
+    request(`/projects/${project}/meetings/${meeting}/live?after=${after}`),
+  liveStart: (project, meeting, { model_size, mode } = {}) =>
+    request(`/projects/${project}/meetings/${meeting}/live/start`, {
+      method: "POST",
+      body: { ...(model_size ? { model_size } : {}), ...(mode ? { mode } : {}) }
+    }),
+  liveStop: (project, meeting) =>
+    request(`/projects/${project}/meetings/${meeting}/live/stop`, { method: "POST" }),
+  // Plain text, not JSON: this is the file an external agent tails.
+  liveTranscript: (project, meeting) => textRequest(`/projects/${project}/meetings/${meeting}/live/transcript`),
 
   transcribe: (project, meeting) =>
     request(`/projects/${project}/meetings/${meeting}/transcribe`, { method: "POST" }),

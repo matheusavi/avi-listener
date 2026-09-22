@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { prepareChromeTabCapture } from "./chromeTabCapture.js";
+import LiveTranscriptPanel from "./LiveTranscriptPanel.jsx";
 import Speakers from "./Speakers.jsx";
 import { api } from "./api.js";
 
@@ -72,6 +73,7 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
   const [tab, setTab] = useState("merged");
   const [transcript, setTranscript] = useState(null);
   const [logs, setLogs] = useState(null);
+  const [liveText, setLiveText] = useState("");
   const [channels, setChannels] = useState(null);
   const [channelId, setChannelId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -108,18 +110,22 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
   const isRecording = Boolean(recording?.running) || discordRunning;
   const elapsed = recording?.elapsed ?? meeting?.discord?.elapsed ?? 0;
   const jobRunning = job?.status === "running";
+  const liveActive = Boolean(meeting?.live?.active);
 
   // Only poll while something is actually happening, so an idle dashboard is
-  // not hammering the API.
+  // not hammering the API. A live session counts: it keeps writing lines, so
+  // the meeting payload (and its `live` summary) keeps changing.
   useEffect(() => {
-    if (!isRecording && !jobRunning) return undefined;
+    if (!isRecording && !jobRunning && !liveActive) return undefined;
     const timer = setInterval(() => {
       load().then((data) => {
-        if (data && !data.recording?.running && !data.discord?.running && !data.active_job) onChanged?.();
+        if (data && !data.recording?.running && !data.discord?.running && !data.active_job && !data.live?.active) {
+          onChanged?.();
+        }
       });
     }, 1200);
     return () => clearInterval(timer);
-  }, [isRecording, jobRunning, load, onChanged]);
+  }, [isRecording, jobRunning, liveActive, load, onChanged]);
 
   useEffect(() => {
     if (!meeting?.discord_available || !sources.includes("discord") || channels !== null) return;
@@ -140,6 +146,8 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
       try {
         if (which === "logs") {
           setLogs(await api.logs(projectSlug, meetingSlug));
+        } else if (which === "live") {
+          setLiveText(await api.liveTranscript(projectSlug, meetingSlug));
         } else {
           setTranscript(await api.transcript(projectSlug, meetingSlug, which));
         }
@@ -154,7 +162,7 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
     if (!meeting) return;
     showTab(tab);
   }, [tab, showTab, meeting?.artifacts.has_merged, meeting?.artifacts.has_diarized, meeting?.artifacts.has_transcripts,
-      meeting?.jobs?.[0]?.finished_at]);
+      meeting?.jobs?.[0]?.finished_at, meeting?.live?.lines_total]);
 
   const act = async (fn) => {
     setError(null);
@@ -231,6 +239,7 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
     if (meeting.artifacts.has_merged) tabs.push({ id: "merged", label: "Everyone (merged)" });
     if (meeting.artifacts.has_diarized) tabs.push({ id: "diarized", label: "Shared audio by speaker" });
     if (meeting.artifacts.has_transcripts) tabs.push({ id: "segments", label: "By source" });
+    if (meeting.live?.lines_total > 0) tabs.push({ id: "live", label: "Live" });
     tabs.push({ id: "logs", label: "Logs" });
     return tabs;
   }, [meeting]);
@@ -355,6 +364,17 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
         )}
       </Step>
 
+      {/* Not a numbered step: live transcription is a side channel, so the
+          offline pipeline keeps its 1-2-3-4 numbering. */}
+      <Step index="•" title="Live transcript" enabled>
+        <LiveTranscriptPanel
+          project={projectSlug}
+          meeting={meetingSlug}
+          live={meeting.live}
+          onChanged={load}
+        />
+      </Step>
+
       <Step
         index={2}
         title="Transcribe"
@@ -470,7 +490,26 @@ export default function MeetingView({ projectSlug, meetingSlug, onChanged }) {
               </button>
             ))}
           </div>
-          {tab === "logs" ? (
+          {tab === "live" ? (
+            <div className="transcript">
+              {liveText.trim() ? (
+                liveText.trimEnd().split("\n").map((line, index) => {
+                  // Live lines are "[HH:MM:SS] source: text", not the pipe-separated merged format.
+                  const match = line.match(/^\[(.+?)\]\s*([^:]+):\s*(.*)$/);
+                  if (!match) return <div key={index} className="line"><div className="what" style={{ gridColumn: "1 / -1" }}>{line}</div></div>;
+                  return (
+                    <div key={index} className="line">
+                      <div className="time">{match[1]}</div>
+                      <div className="who">{match[2]}</div>
+                      <div className="what">{match[3]}</div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="empty">Nothing transcribed live yet.</div>
+              )}
+            </div>
+          ) : tab === "logs" ? (
             <>
               {logs?.files?.length > 1 ? (
                 <select
