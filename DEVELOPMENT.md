@@ -10,6 +10,7 @@ that looked correct while being wrong.
 avilistener/            Python package
   audio.py              device discovery (soundcard/WASAPI)
   recorder.py           silence segmenter, adaptive gate, WAV writing
+  live.py               prototype: transcribe each clip as it is recorded
   file_transcriber.py   WAV directory -> transcript, filename parsing
   transcriber.py        faster-whisper wrapper, hallucination filters, and
                         build_transcriber(): settings dict -> Transcriber
@@ -19,7 +20,7 @@ avilistener/            Python package
   timeline.py           read-only inputs, compact audio, per-part clock mapping
   processing.py         staged publication, multipart jobs, content-keyed caches
   speakers.py           per-speaker audio samples for identification
-  cli.py                dashboard, list-devices, levels — nothing else
+  cli.py                dashboard, list-devices, levels, live — nothing else
   server/               dashboard: workspace model, jobs, FastAPI
 discord-receiver/       Node.js Discord bot, one WAV per participant
 web/                    React dashboard (Vite)
@@ -109,6 +110,43 @@ metrics as the WASAPI threads, then feeds `SilenceSegmenter` and
 `ContinuousWriter` directly. The WAV sample rate comes from the browser's actual
 `AudioContext`; assuming the requested 16 kHz would make timestamps drift on a
 browser that chose another rate.
+
+## Live transcription prototype
+
+`avilistener live` exists to answer one question before anything is built on
+top of it: on this machine, how long after someone stops speaking does their
+line appear? The answer depends on the model size, the device and how long
+people talk for, so it has to be measured rather than estimated. Every printed
+line carries its own latency, and the run ends with an average and a worst case.
+
+Recording is unchanged. Clips are still written to disk under the same filename
+contract, so the ordinary pipeline can be run over the same session afterwards
+and remains the source of truth; live output is a read-only extra.
+
+`live.py` sits between the two. `LiveTranscriber.submit` has exactly the
+signature of `SourceRecorder.on_saved` and does nothing but put the path on a
+queue; a separate worker thread reads the WAV, transcribes it and calls back
+with a `LiveLine`. That decoupling is the whole design: transcription takes
+seconds and the recorder thread must never wait for it, because a stalled
+recorder loses audio that cannot be recovered. If the model cannot keep up, the
+queue grows and lines arrive late while the recording stays intact. A clip that
+fails is reported and skipped; it never kills the worker. On Ctrl+C the recorder
+threads are joined rather than killed (same reason as above) and the queue is
+drained, so the last utterances still appear.
+
+**Diarization is not available live.** It needs the unbroken session audio and a
+pass over the whole recording, so live lines are labelled by source (`mic`,
+`system`, ...) only. Who said what inside a shared source is still an offline
+question.
+
+```powershell
+.\.venv\Scripts\avilistener.exe live --model small --device cuda
+```
+
+`--model`, `--device` and `--compute-type` override the config for that run
+only, which is the point: a smaller model for live latency, the large one kept
+in `config.yaml` for the offline transcript. Clips land in
+`workspace/live/<timestamp>/` unless `--output` says otherwise.
 
 ## Why PC audio, and not an integration with the meeting app
 

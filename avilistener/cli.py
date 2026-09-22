@@ -36,6 +36,20 @@ def main() -> None:
     levels_parser.add_argument("--config", default="config.yaml", help="Path to config YAML.")
     levels_parser.add_argument("--duration", type=float, default=10.0, help="Seconds to measure for.")
 
+    live_parser = subparsers.add_parser(
+        "live",
+        help="Prototype: record and transcribe each utterance as it is captured, printing its latency.",
+    )
+    live_parser.add_argument("--config", default="config.yaml", help="Path to config YAML.")
+    live_parser.add_argument("--output", default=None, help="Where to write clips. Defaults to workspace/live/<timestamp>/.")
+    live_parser.add_argument(
+        "--model",
+        default=None,
+        help="Whisper model size for this run only. A smaller model (small, medium) lowers latency.",
+    )
+    live_parser.add_argument("--device", default=None, help="Override the config device (cuda or cpu).")
+    live_parser.add_argument("--compute-type", default=None, help="Override the config compute type (for example int8 or float16).")
+
     args = parser.parse_args()
     if args.command == "dashboard":
         dashboard(args.host, args.port)
@@ -45,6 +59,15 @@ def main() -> None:
         return
     if args.command == "levels":
         levels(Path(args.config), args.duration)
+        return
+    if args.command == "live":
+        live(
+            Path(args.config),
+            Path(args.output) if args.output else None,
+            args.model,
+            args.device,
+            args.compute_type,
+        )
         return
 
 
@@ -110,6 +133,119 @@ def levels(config_path: Path, duration: float) -> None:
     console.print(table)
     console.print("[cyan]Peak should sit well above the gate while you talk. If it does not,[/cyan]")
     console.print("[cyan]raise your input volume, or set sources.<name>.silence_rms_threshold.[/cyan]")
+
+
+def live(
+    config_path: Path,
+    output_dir: Path | None,
+    model_size: str | None,
+    device: str | None,
+    compute_type: str | None,
+) -> None:
+    """Record and transcribe each utterance as it closes, printing its latency.
+
+    A prototype for one question: on this machine, how long after someone stops
+    speaking does their line appear? That number decides whether a live view is
+    worth building, and it cannot be answered by reading code.
+
+    Clips are still written to disk in the usual format, so the same session can
+    be put through the ordinary pipeline afterwards. Diarization is not
+    available live, so lines are labelled by source only.
+    """
+    from datetime import datetime
+
+    from avilistener.live import LiveTranscriber, format_live_line
+    from avilistener.recorder import SourceRecorder
+    from avilistener.transcriber import build_transcriber
+
+    config = _load_config(config_path)
+    sources = list(enabled_sources(config.get("sources", {})))
+    if not sources:
+        raise SystemExit("No enabled sources in config.")
+
+    # Copied, never mutated: the loaded config still describes the big model the
+    # offline pipeline should use, while live runs can try a faster one.
+    effective_config = dict(config)
+    if model_size:
+        effective_config["model_size"] = model_size
+    if device:
+        effective_config["device"] = device
+    if compute_type:
+        effective_config["compute_type"] = compute_type
+
+    if output_dir is None:
+        output_dir = Path.cwd() / "workspace" / "live" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"[bold]Live transcription prototype[/bold] ({', '.join(s.name for s in sources)})")
+    console.print(f"[cyan]Clips are written to {output_dir}[/cyan]")
+    console.print(
+        f"[cyan]Loading model {effective_config.get('model_size', 'large-v3')} "
+        f"on {effective_config.get('device', 'cuda')}. This pause is the model, not recording.[/cyan]"
+    )
+    # Loaded before any recorder starts, so the load never eats the first
+    # utterance and the pause the user sees is explained.
+    transcriber = build_transcriber(effective_config)
+
+    def print_line(line) -> None:
+        # markup off: a transcript containing square brackets is text, not rich
+        # markup, and must not be swallowed or raise.
+        console.print(format_live_line(line), markup=False, highlight=False)
+
+    def print_error(path: Path, exc: Exception) -> None:
+        console.print(f"Failed to transcribe {path.name}: {exc}", style="red", markup=False, highlight=False)
+
+    live_transcriber = LiveTranscriber(transcriber, print_line, print_error)
+    live_transcriber.start()
+
+    stop_event = threading.Event()
+    recorders = [
+        SourceRecorder(
+            source,
+            output_dir,
+            _segment_settings(config, source.name),
+            stop_event,
+            on_saved=live_transcriber.submit,
+            continuous=False,
+        )
+        for source in sources
+    ]
+    for recorder in recorders:
+        recorder.start()
+
+    console.print("[green]Listening. Press Ctrl+C to stop.[/green]")
+    try:
+        while any(recorder.is_alive() for recorder in recorders):
+            for recorder in recorders:
+                recorder.join(timeout=0.5)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Stopping...[/yellow]")
+
+    stop_event.set()
+    # Joined rather than abandoned: a recorder killed mid-write leaves a WAV
+    # whose header claims zero length.
+    for recorder in recorders:
+        recorder.join(timeout=30)
+
+    pending = live_transcriber.pending
+    if pending:
+        console.print(f"[cyan]Transcribing {pending} remaining clip(s)...[/cyan]")
+    live_transcriber.stop(drain=True, timeout=300)
+
+    for recorder in recorders:
+        if recorder.error is not None:
+            console.print(f"[red]{recorder.source.name} failed: {recorder.error}[/red]")
+
+    console.print(
+        f"[bold]Transcribed {live_transcriber.lines_emitted} clip(s), "
+        f"skipped {live_transcriber.clips_skipped}.[/bold]"
+    )
+    if live_transcriber.lines_emitted:
+        console.print(
+            f"[bold]Latency: {live_transcriber.average_latency:.1f}s average, "
+            f"{live_transcriber.max_latency:.1f}s worst.[/bold]"
+        )
+    console.print(f"[cyan]Clips kept in {output_dir} for the offline pipeline.[/cyan]")
 
 
 def _segment_settings(config: dict, source_name: str):
