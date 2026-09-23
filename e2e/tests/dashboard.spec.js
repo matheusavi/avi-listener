@@ -8,7 +8,7 @@
 // next, merging two clocks into one timeline, naming speakers, and keeping
 // tokens out of the browser - fully exercised.
 
-import { copyFileSync, existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { expect, test } from "@playwright/test";
@@ -25,6 +25,51 @@ async function openMeeting(page, name) {
 /** The card for one numbered step, found by its heading. */
 function stepCard(page, title) {
   return page.locator(".card").filter({ has: page.getByRole("heading", { name: title }) });
+}
+
+/** The card holding the transcript/log tabs, at the bottom of a meeting. */
+function tabCard(page) {
+  return page.locator(".card").filter({ has: page.locator(".tabs") });
+}
+
+/** A 16 kHz mono PCM16 WAV holding a short tone - the shape both recorders write. */
+function wavClip(seconds = 0.5, frequency = 220) {
+  const rate = 16000;
+  const frames = Math.round(seconds * rate);
+  const audio = Buffer.alloc(frames * 2);
+  for (let index = 0; index < frames; index += 1) {
+    audio.writeInt16LE(Math.round(6000 * Math.sin((2 * Math.PI * frequency * index) / rate)), index * 2);
+  }
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + audio.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(rate, 24);
+  header.writeUInt32LE(rate * 2, 28); // bytes per second
+  header.writeUInt16LE(2, 32); // block align
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(audio.length, 40);
+  return Buffer.concat([header, audio]);
+}
+
+/**
+ * Write one clip the way a recorder would: `<utc stamp>Z-<source>-<digits>.wav`
+ * (see `segment_filename` in avilistener/recorder.py). The stamp is taken now,
+ * which is what puts the clip after the running session's watermark; the
+ * trailing digits are the source's id and any digits will do.
+ */
+function writeClip(meetingDir, source) {
+  const stamp = new Date().toISOString().replace(/:/g, "-").replace(".", "-");
+  const name = `${stamp}-${source}-1000000001.wav`;
+  const directory = path.join(meetingDir, "recordings");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, name), wavClip());
+  return name;
 }
 
 /** The "Call me" box in a meeting's merge step, where it labels the input. */
@@ -251,15 +296,16 @@ test.describe("reading the results", () => {
   test("the logs tab shows what the recorder wrote", async ({ page }) => {
     await openMeeting(page, "Recorded Meeting");
 
+    // Scoped to the tab card: the live panel renders a `.log` of its own.
     await page.locator(".tabs").getByRole("button", { name: "Logs" }).click();
-    await expect(page.locator(".log")).toContainText("recording started: mic, system");
+    await expect(tabCard(page).locator(".log")).toContainText("recording started: mic, system");
   });
 
   test("a meeting with no logs says so instead of failing", async ({ page }) => {
     await openMeeting(page, "Empty Meeting");
 
     await page.locator(".tabs").getByRole("button", { name: "Logs" }).click();
-    await expect(page.locator(".log")).toContainText("No logs yet.");
+    await expect(tabCard(page).locator(".log")).toContainText("No logs yet.");
   });
 
   test("a second log can be picked from the list", async ({ page }) => {
@@ -267,12 +313,12 @@ test.describe("reading the results", () => {
     await page.locator(".tabs").getByRole("button", { name: "Logs" }).click();
 
     // Newest first, so the transcribe log is what opens.
-    await expect(page.locator(".log")).toContainText("Transcribed 2 file(s)");
+    await expect(tabCard(page).locator(".log")).toContainText("Transcribed 2 file(s)");
 
-    const picker = page.locator(".card select");
+    const picker = tabCard(page).locator("select");
     await expect(picker).toBeVisible();
     await picker.selectOption("2026-08-24T15-48-48-recording.log");
-    await expect(page.locator(".log")).toContainText("recording started: mic, system");
+    await expect(tabCard(page).locator(".log")).toContainText("recording started: mic, system");
   });
 });
 
@@ -491,5 +537,89 @@ test.describe("Chrome tab audio", () => {
 
     await expect(record).toContainText(/chrome \(1 clip/);
     await expect(stepCard(page, "Split shared audio by speaker").getByRole("button", { name: "Split by speaker" })).toBeEnabled();
+  });
+});
+
+test.describe("live transcript", () => {
+  // The one test that watches files on disk turn into text on screen. Clips
+  // are written by the test rather than recorded, exactly as the Discord
+  // receiver writes them from another process - which is the case the scan
+  // loop exists for. The transcriber is the fake one selected by
+  // AVILISTENER_LIVE_FAKE_TRANSCRIBER in the config, so no model is loaded.
+  const meetingDir = path.join(workspaceDir, "e2e-project", "live-meeting");
+  const liveLine = (source) =>
+    new RegExp(`^\\[\\d{2}:\\d{2}:\\d{2}\\] ${source}: simulated transcript of ${source} clip$`);
+
+  test("clips dropped into recordings become live lines, and stop resumes where it left off", async ({
+    page,
+    request
+  }) => {
+    // Longer than the suite default: each clip has to age a second before it
+    // is eligible, and this walks through start, stop and resume.
+    test.setTimeout(90_000);
+
+    await openMeeting(page, "Live Meeting");
+    const card = stepCard(page, "Live transcript");
+    const log = card.locator(".log");
+    const pill = card.locator(".pill");
+
+    await card.locator("select").selectOption("tiny");
+    await card.getByRole("button", { name: "Start live" }).click();
+    await expect(pill).toContainText("running");
+    await expect(pill).toContainText("tiny");
+
+    // Only now, so the filenames are stamped after the session's watermark.
+    const first = writeClip(meetingDir, "mic");
+    const second = writeClip(meetingDir, "system");
+
+    // A second of file age plus a second of scan, then the panel's own poll.
+    await expect(log.locator("div")).toHaveCount(2, { timeout: 15_000 });
+    const shown = await log.locator("div").allTextContents();
+    expect(shown[0]).toMatch(liveLine("mic"));
+    expect(shown[1]).toMatch(liveLine("system"));
+
+    const transcript = await (
+      await request.get("/api/projects/e2e-project/meetings/live-meeting/live/transcript")
+    ).text();
+    const written = transcript.trimEnd().split("\n");
+    expect(written).toHaveLength(2);
+    expect(written[0]).toMatch(liveLine("mic"));
+    expect(written[1]).toMatch(liveLine("system"));
+
+    // What was fed to the model is kept beside the transcript...
+    expect(readdirSync(path.join(meetingDir, "live", "clips")).sort()).toEqual([first, second].sort());
+    // ...and `recordings/` is left exactly as the recorder left it. Live never
+    // moves, renames or deletes there: the offline pipeline decides staleness
+    // by what that folder holds.
+    expect(readdirSync(path.join(meetingDir, "recordings")).sort()).toEqual([first, second].sort());
+
+    await card.getByRole("button", { name: "Stop" }).click();
+    await expect(card.getByRole("button", { name: "Start from now" })).toBeEnabled();
+    await expect(card.getByRole("button", { name: "Resume (catch up)" })).toBeEnabled();
+    await expect(pill).toContainText("stopped");
+
+    // Missed while stopped: catching up is what makes a model change, or a
+    // restart, cost nothing but the pause itself.
+    const third = writeClip(meetingDir, "mic");
+    await card.getByRole("button", { name: "Resume (catch up)" }).click();
+    await expect(log.locator("div")).toHaveCount(3, { timeout: 15_000 });
+    // The two earlier lines are re-read from the file, which carries no clock,
+    // so only the new one is stamped.
+    expect((await log.locator("div").allTextContents())[2]).toMatch(liveLine("mic"));
+    expect(readdirSync(path.join(meetingDir, "live", "clips"))).toContain(third);
+
+    await card.getByRole("button", { name: "Stop" }).click();
+    await expect(card.getByRole("button", { name: "Resume (catch up)" })).toBeEnabled();
+
+    // The same lines, read back from live-transcript.txt by the tab strip.
+    await page.locator(".tabs").getByRole("button", { name: "Live" }).click();
+    const panel = page.locator(".transcript");
+    await expect(panel.locator(".line")).toHaveCount(3);
+    expect((await panel.locator(".who").allTextContents()).map((item) => item.trim())).toEqual([
+      "mic",
+      "system",
+      "mic"
+    ]);
+    await expect(panel).toContainText("simulated transcript of system clip");
   });
 });

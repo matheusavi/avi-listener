@@ -107,6 +107,7 @@ input, select {
 .pill { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .pill.live { border-color: var(--bad); color: var(--bad); }
 .pill.good { border-color: var(--good); color: var(--good); }
+.pill.warn { border-color: var(--warn); color: var(--warn); }
 
 .meters { display: flex; gap: 16px; margin-top: 12px; flex-wrap: wrap; }
 .meter { min-width: 150px; }
@@ -124,6 +125,33 @@ input, select {
   padding: 10px 12px; font-family: ui-monospace, Consolas, monospace;
   font-size: 12px; max-height: 160px; overflow-y: auto; white-space: pre-wrap;
   color: var(--muted); margin-top: 10px;
+}
+
+/* A scroll box whose scrollbar is actually visible on the dark theme: the
+   browser default is nearly invisible against the panel, so a bounded region
+   looks like it simply lost its content. Shared by every such region. */
+.scroll-dark {
+  overflow-y: auto; scrollbar-gutter: stable;
+  color-scheme: dark; scrollbar-color: #3a4150 #0b0d11;
+}
+.scroll-dark::-webkit-scrollbar { width: 12px; }
+.scroll-dark::-webkit-scrollbar-track { background: #0b0d11; border-radius: 8px; }
+.scroll-dark::-webkit-scrollbar-thumb { background: #3a4150; border-radius: 8px; border: 2px solid #0b0d11; }
+.scroll-dark::-webkit-scrollbar-thumb:hover { background: #4b5468; }
+
+/* The live log is bounded so a long session never pushes the rest of the page
+   away; it scrolls inside, with a way back to the newest line after reading
+   older ones. `scroll` rather than `auto`: the bar is there from the first
+   line, so the log never reflows the moment it overflows. */
+.live-log-wrap { position: relative; }
+.live-log { max-height: 40vh; min-height: 120px; overflow-y: scroll; }
+/* The Live tab shows the same transcript, read back from the file. */
+.live-transcript { max-height: 60vh; }
+.live-jump {
+  position: absolute; right: 24px; bottom: 12px;
+  font-size: 12px; padding: 5px 10px; border-radius: 999px;
+  background: var(--panel-2); border-color: var(--accent); color: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
 }
 
 .tabs { display: flex; gap: 6px; margin-bottom: 12px; }

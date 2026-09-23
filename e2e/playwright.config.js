@@ -33,6 +33,12 @@ export default defineConfig({
     timeout: 60_000,
     env: {
       AVILISTENER_WORKSPACE: workspaceDir,
+      // Live transcription then runs against a fake transcriber instead of
+      // Whisper, so the live tests need no GPU, no model download and no
+      // seconds spent loading one. Only the live path reads this flag - the
+      // offline transcribe/diarize/merge steps are untouched by it, and are
+      // still never run here.
+      AVILISTENER_LIVE_FAKE_TRANSCRIBER: "1",
       // Blanked rather than inherited: whether the machine running the tests
       // happens to have a Discord or Hugging Face token is not something the
       // assertions should depend on.

@@ -197,6 +197,12 @@ def main() -> None:
 
     create_meeting(project, "empty-meeting", "Empty Meeting", 100.0)
 
+    # The live test drops clips into this meeting's `recordings/` while the
+    # dashboard is watching it. It gets a meeting of its own because every
+    # other meeting's assertions count the clips it has, and a folder that
+    # grows mid-run would move those counts under them.
+    create_meeting(project, "live-meeting", "Live Meeting", 600.0)
+
     recorded = create_meeting(project, "recorded-meeting", "Recorded Meeting", 200.0)
     seed_recording(recorded)
     seed_logs(recorded)
