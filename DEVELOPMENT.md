@@ -176,7 +176,7 @@ also keeps live off the recorder threads entirely, which matters because a
 stalled recorder loses audio that cannot be recovered; live can be started,
 stopped and pointed at a different model without any of them noticing. The
 found clip is then *copied* into `live/clips/`, so what was actually fed to the
-live model survives the original being moved to `processed/`.
+live model is kept whatever later happens to the original.
 
 **A clip is ready when it is a second old and its header agrees with its
 size.** Both recorders write a whole WAV in one go once the silence gate closes

@@ -23,7 +23,7 @@ offline pipeline counts, hashes and compares those files to decide whether a
 transcript is stale, so a single extra file in there would make every artifact
 look out of date and could be transcribed a second time. Copying also decouples
 the two lifetimes - the copy under `live/clips/` is what was actually fed to
-the live model, and it stays put even if the original is moved to `processed/`.
+the live model, whatever later happens to the original.
 
 **A clip is eligible once it is old enough and its header is consistent.** Both
 recorders write a whole clip in one go once the silence gate closes it (the
@@ -79,6 +79,10 @@ _LINE_PATTERN = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\] (.*?): (.*)$")
 
 class LiveBusy(RuntimeError):
     """A live session is already running, here or for another meeting."""
+
+
+class _AppendFailed(Exception):
+    """A clip was transcribed but its line could not be written to the file."""
 
 
 def meeting_key(meeting: Meeting) -> str:
@@ -307,6 +311,9 @@ class LiveSession:
         # Submitted but not finished. Kept apart from `seen` so a clip dropped
         # by a stop is offered again rather than silently lost.
         self._queued: set[str] = set()
+        # Transcribed but the line never reached the file. Not marked seen, so
+        # the next scan offers the clip again instead of losing the line.
+        self._unwritten: set[str] = set()
         # Previous sessions' lines are loaded so indexes stay stable across a
         # restart: the interface asks for everything after the last index it
         # saw, and that must not start over at zero.
@@ -345,7 +352,8 @@ class LiveSession:
         # The reference is dropped only after the drain: `snapshot` reads it,
         # and nulling it first made the dashboard show zeros for as long as the
         # clip already inside the model took to finish - up to a minute.
-        live = self._live
+        with self._lock:
+            live = self._live
         if live is not None:
             # drain=False: queued clips are not marked seen, so `catch_up`
             # picks them up instead of the user waiting out a backlog.
@@ -384,14 +392,22 @@ class LiveSession:
                 self._error = str(exc) or exc.__class__.__name__
             return
 
-        self._live = LiveTranscriber(
+        live = LiveTranscriber(
             transcriber,
             on_line=self._on_line,
             on_error=self._on_clip_error,
             on_done=self._on_clip_done,
         )
-        self._live.start()
+        # A stop that gave up waiting for a slow load (a first-use download can
+        # take minutes) has already reported `stopped`. Publishing a worker now
+        # would flip the session back to `running` with nothing left to stop
+        # it, holding the model and the slot. Checked under the lock `stop`
+        # reads `_live` under, so one of the two always sees the other.
         with self._lock:
+            if self._stop.is_set():
+                return
+            live.start()
+            self._live = live
             self._status = "running"
 
         while not self._stop.is_set():
@@ -412,7 +428,9 @@ class LiveSession:
             self.scans += 1
             return
         # Top level only: `continuous/` holds hour-long session files and
-        # `processed/` holds clips the offline pipeline already consumed.
+        # `processed/` holds legacy clips an older offline pipeline moved
+        # there. Nothing moves clips out of the top level any more - the
+        # dashboard pipeline only reads them - so every new clip is here.
         # Sorted by the timestamp in the name, not by the name itself: the
         # Discord receiver and the local recorder use different prefixes, so
         # plain name order would transcribe an interleaved meeting per source.
@@ -488,6 +506,14 @@ class LiveSession:
 
     # -- callbacks from the transcriber worker -----------------------------
     def _on_line(self, line: LiveLine) -> None:
+        # File first: the file is what outlives the session, so a line the
+        # dashboard shows must already be in it. Raising here reaches
+        # `_on_clip_error` with the clip's path, which is what keeps the clip
+        # out of `seen`.
+        try:
+            self._append_transcript(line)
+        except OSError as exc:
+            raise _AppendFailed(str(exc)) from exc
         with self._lock:
             self._lines.append(
                 line_entry(
@@ -500,20 +526,28 @@ class LiveSession:
                     latency=line.latency,
                 )
             )
-        self._append_transcript(line)
 
     def _on_clip_error(self, path: Path, exc: Exception) -> None:
+        if isinstance(exc, _AppendFailed):
+            logger.warning("Could not append the line for %s, will retry: %s", path, exc)
+            with self._lock:
+                self._unwritten.add(path.name)
+            return
         logger.warning("Live transcription failed for %s: %s", path, exc)
 
     def _on_clip_done(self, path: Path) -> None:
         """The clip left the worker: remember it and write that down.
 
-        Done means done in every sense - a line, a silent skip or a failure -
-        because all three are settled, and only an abandoned clip is not
-        announced here.
+        Done means done in every sense - a line, a silent skip or a failed
+        transcription - because all three are settled. Two are not: a clip
+        abandoned by a stop, which is never announced here, and one whose
+        line could not be written, which goes back to the scan for a retry.
         """
         with self._lock:
             self._queued.discard(path.name)
+            if path.name in self._unwritten:
+                self._unwritten.discard(path.name)
+                return
             self._seen.add(path.name)
         self._persist_state()
 
@@ -523,15 +557,12 @@ class LiveSession:
 
         Same reason as the job logs: an external agent tails this file while
         the meeting runs, and a buffered write would show it nothing until the
-        session ended.
+        session ended. Raises `OSError`; the caller decides what a lost line means.
         """
         path = self.meeting.live_transcript_path
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(format_transcript_line(line.source, line.text, line.started_at) + "\n")
-        except OSError as exc:
-            logger.warning("Could not append to %s: %s", path, exc)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(format_transcript_line(line.source, line.text, line.started_at) + "\n")
 
     def _persist_state(self) -> None:
         """Replace `state.json` atomically, one writer at a time.
@@ -622,8 +653,8 @@ def _scan_order(path: Path) -> tuple[float, str]:
     """`sort_key_for_discord_wav`, tolerant of a clip that vanished mid-scan.
 
     The key falls back to `st_mtime` for a name it cannot parse, and a file
-    moved to `processed/` between the glob and the sort would raise there -
-    losing the whole cycle over a clip that is no longer any of our business.
+    deleted or moved between the glob and the sort would raise there - losing
+    the whole cycle over a clip that is no longer any of our business.
     """
     try:
         return sort_key_for_discord_wav(path)

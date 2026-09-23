@@ -436,6 +436,31 @@ class TestTranscriptAndStatus:
             "system: text from system",
         ]
 
+    def test_a_line_that_could_not_be_written_is_retried_not_lost(self, env, monkeypatch) -> None:
+        real_append = LiveSession._append_transcript
+        failures = []
+
+        def flaky_append(session, line) -> None:
+            if not failures:
+                failures.append(line)
+                raise PermissionError("locked by another process")
+            real_append(session, line)
+
+        monkeypatch.setattr(LiveSession, "_append_transcript", flaky_append)
+        env.clip("mic", BASE + 10)
+        manager = env.manager()
+        manager.start(env.meeting)
+        env.wait_running(manager)
+        env.clock.advance(30)
+        wait_for(lambda: manager.status(env.meeting)["lines_total"] == 1, "the line was never written")
+        wait_for(lambda: manager.status(env.meeting)["clips_seen"] == 1, "the clip was never settled")
+
+        assert failures, "the append never failed, so nothing was tested"
+        assert env.transcriber.count == 2, "the clip should be transcribed again after the failed write"
+        written = env.meeting.live_transcript_path.read_text(encoding="utf-8").splitlines()
+        assert [line.split("] ", 1)[1] for line in written] == ["mic: text from mic"]
+        assert [line["text"] for line in manager.status(env.meeting)["lines"]] == ["text from mic"]
+
     def test_after_returns_only_newer_lines(self, env) -> None:
         env.clip("mic", BASE + 10)
         env.clip("system", BASE + 20)
@@ -563,6 +588,38 @@ class TestManagerLifecycle:
         working = env.manager()
         working.start(env.meeting)  # must not be blocked by the dead session
         env.wait_running(working)
+
+    def test_a_load_that_outlives_the_stop_does_not_come_back_running(self, env) -> None:
+        loading = threading.Event()
+        release = threading.Event()
+
+        def slow_load(config: dict):
+            loading.set()
+            release.wait(TIMEOUT)
+            return env.transcriber
+
+        manager = LiveManager(
+            transcriber_factory=slow_load,
+            clock=env.clock,
+            min_clip_age=1.0,
+            scan_interval=0.02,
+            stop_timeout=0.05,  # gives up on the load, as a first-use download would force
+        )
+        env.managers.append(manager)
+        manager.start(env.meeting)
+        assert loading.wait(TIMEOUT), "the model load never began"
+        session = manager.session
+        scan_thread = session._thread
+
+        assert manager.stop(env.meeting)["status"] == "stopped"
+        release.set()
+        scan_thread.join(TIMEOUT)
+        assert not scan_thread.is_alive(), "the session thread never finished"
+
+        assert manager.status(env.meeting)["status"] == "stopped", "the late load flipped the session back to running"
+        assert session._live is None, "a worker was started for a session that was already stopped"
+        manager.start(env.meeting)  # the slot is free
+        env.wait_running(manager)
 
     def test_an_unknown_mode_is_refused(self, env) -> None:
         with pytest.raises(ValueError):
